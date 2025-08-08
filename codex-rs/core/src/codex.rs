@@ -44,6 +44,7 @@ use crate::config::Config;
 use crate::config_types::ShellEnvironmentPolicy;
 use crate::conversation_history::ConversationHistory;
 use crate::error::CodexErr;
+use crate::error::CodexErr::InactivityTimeout;
 use crate::error::Result as CodexResult;
 use crate::error::SandboxErr;
 use crate::error::get_error_message_ui;
@@ -1293,6 +1294,8 @@ async fn run_turn(
             Err(e @ (CodexErr::UsageLimitReached(_) | CodexErr::UsageNotIncluded)) => {
                 return Err(e);
             }
+            // Inactivity timeout is terminal; do not retry.
+            Err(e @ CodexErr::InactivityTimeout(_)) => return Err(e),
             Err(e) => {
                 // Use the configured provider-specific stream retry budget.
                 let max_retries = sess.client.get_provider().stream_max_retries();
@@ -1339,6 +1342,8 @@ async fn try_run_turn(
     sub_id: &str,
     prompt: &Prompt,
 ) -> CodexResult<Vec<ProcessedResponseItem>> {
+    // Consider lack of any stream events for this duration as inactivity.
+    const INACTIVITY_TIMEOUT_SECS: u64 = 120;
     // call_ids that are part of this response.
     let completed_call_ids = prompt
         .input
@@ -1402,7 +1407,21 @@ async fn try_run_turn(
         // Poll the next item from the model stream. We must inspect *both* Ok and Err
         // cases so that transient stream failures (e.g., dropped SSE connection before
         // `response.completed`) bubble up and trigger the caller's retry logic.
-        let event = stream.next().await;
+        // Apply inactivity timeout to waiting for the next event from the agent.
+        let next_event = tokio::time::timeout(
+            std::time::Duration::from_secs(INACTIVITY_TIMEOUT_SECS),
+            stream.next(),
+        )
+        .await;
+
+        let event = match next_event {
+            Err(_) => {
+                // Timed out waiting for any activity.
+                return Err(InactivityTimeout(INACTIVITY_TIMEOUT_SECS));
+            }
+            Ok(ev) => ev,
+        };
+
         let Some(event) = event else {
             // Channel closed without yielding a final Completed event or explicit error.
             // Treat as a disconnected stream so the caller can retry.
@@ -1524,6 +1543,17 @@ async fn run_compact_task(
         match attempt_result {
             Ok(()) => break,
             Err(CodexErr::Interrupted) => return,
+            // Inactivity timeout is terminal; do not retry.
+            Err(CodexErr::InactivityTimeout(_)) => {
+                let event = Event {
+                    id: sub_id.clone(),
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: CodexErr::InactivityTimeout(120).to_string(),
+                    }),
+                };
+                sess.send_event(event).await;
+                return;
+            }
             Err(e) => {
                 if retries < max_retries {
                     retries += 1;
@@ -2209,9 +2239,16 @@ fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<St
 }
 
 async fn drain_to_completed(sess: &Session, sub_id: &str, prompt: &Prompt) -> CodexResult<()> {
+    // Consider lack of any stream events for this duration as inactivity.
+    const INACTIVITY_TIMEOUT_SECS: u64 = 120;
     let mut stream = sess.client.clone().stream(prompt).await?;
     loop {
-        let maybe_event = stream.next().await;
+        let maybe_event = tokio::time::timeout(
+            std::time::Duration::from_secs(INACTIVITY_TIMEOUT_SECS),
+            stream.next(),
+        )
+        .await
+        .map_err(|_| InactivityTimeout(INACTIVITY_TIMEOUT_SECS))?;
         let Some(event) = maybe_event else {
             return Err(CodexErr::Stream(
                 "stream closed before response.completed".into(),

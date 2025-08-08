@@ -48,6 +48,12 @@ pub enum CodexErr {
     #[error("timeout waiting for child process to exit")]
     Timeout,
 
+    /// Returned when there has been no activity from the agent stream for a
+    /// configured period of time (e.g., 120 seconds). Treat as a terminal
+    /// error for the current task rather than a transient stream error.
+    #[error("no agent activity for {0} seconds; aborting")]
+    InactivityTimeout(u64),
+
     /// Returned by run_command_stream when the child could not be spawned (its stdout/stderr pipes
     /// could not be captured). Analogous to the previous `CodexError::Spawn` variant.
     #[error("spawn failed: child stdout/stderr not captured")]
