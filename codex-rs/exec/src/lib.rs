@@ -18,7 +18,6 @@ use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::InputItem;
 use codex_core::protocol::Op;
-use codex_core::protocol::TaskCompleteEvent;
 use codex_core::util::is_inside_git_repo;
 use codex_login::AuthManager;
 use codex_ollama::DEFAULT_OSS_MODEL;
@@ -237,30 +236,17 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         });
     }
 
-    // Send images first, if any.
-    if !images.is_empty() {
-        let items: Vec<InputItem> = images
-            .into_iter()
-            .map(|path| InputItem::LocalImage { path })
-            .collect();
-        let initial_images_event_id = conversation.submit(Op::UserInput { items }).await?;
-        info!("Sent images with event ID: {initial_images_event_id}");
-        while let Ok(event) = conversation.next_event().await {
-            if event.id == initial_images_event_id
-                && matches!(
-                    event.msg,
-                    EventMsg::TaskComplete(TaskCompleteEvent {
-                        last_agent_message: _,
-                    })
-                )
-            {
-                break;
-            }
-        }
+    // Combine images and prompt into a single submission.
+    let mut items: Vec<InputItem> = Vec::new();
+    
+    // Add text prompt first
+    items.push(InputItem::Text { text: prompt });
+    
+    // Then add images if any
+    for path in images {
+        items.push(InputItem::LocalImage { path });
     }
-
-    // Send the prompt.
-    let items: Vec<InputItem> = vec![InputItem::Text { text: prompt }];
+    
     let initial_prompt_task_id = conversation.submit(Op::UserInput { items }).await?;
     info!("Sent prompt with event ID: {initial_prompt_task_id}");
 
