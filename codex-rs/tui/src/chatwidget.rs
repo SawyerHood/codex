@@ -593,8 +593,12 @@ impl ChatWidget {
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), conversation_manager);
+        // Determine whether we should auto-submit an initial message, or
+        // pre‑attach images to the composer for the user to finish the prompt.
+        let initial_prompt_text = initial_prompt.unwrap_or_default();
+        let submit_initial_message = !initial_prompt_text.is_empty();
 
-        Self {
+        let mut this = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
             codex_op_tx,
@@ -607,10 +611,11 @@ impl ChatWidget {
             }),
             active_exec_cell: None,
             config: config.clone(),
-            initial_user_message: create_initial_user_message(
-                initial_prompt.unwrap_or_default(),
-                initial_images,
-            ),
+            initial_user_message: if submit_initial_message {
+                create_initial_user_message(initial_prompt_text, initial_images)
+            } else {
+                None
+            },
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             stream: StreamController::new(config),
@@ -624,7 +629,33 @@ impl ChatWidget {
             last_history_was_exec: false,
             queued_user_messages: VecDeque::new(),
             show_welcome_banner: true,
+        };
+
+        // If images were provided without an accompanying prompt text, treat
+        // them as pre‑attached composer images instead of an auto‑submitted
+        // turn. This avoids kicking off a model turn with only images and no
+        // instruction, which can appear to "hang".
+        if !submit_initial_message && !initial_images.is_empty() {
+            use crate::clipboard_paste::pasted_image_format;
+            for path in initial_images {
+                match image::image_dimensions(&path) {
+                    Ok((w, h)) => {
+                        let format_label = pasted_image_format(&path).label();
+                        this.bottom_pane
+                            .attach_image(path.clone(), w, h, format_label);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping image {} – could not read metadata: {}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
         }
+
+        this
     }
 
     /// Create a ChatWidget attached to an existing conversation (e.g., a fork).
